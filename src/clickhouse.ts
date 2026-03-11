@@ -27,12 +27,14 @@ export interface RiskSummary {
     correlation_risk: number;
     risk_score: number;
     largest_exposure_token: string;
+    largest_exposure_token_name?: string | null;
     ai_summary: string;
     timestamp: string;
 }
 
 export interface TokenMetric {
     token: string;
+    token_name?: string | null;
     price_usd: number;
     volume_24h: number;
     volatility_24h: number;
@@ -42,7 +44,9 @@ export interface TokenMetric {
 export interface PoolData {
     pool_id: string;
     token_a: string;
+    token_a_name?: string | null;
     token_b: string;
+    token_b_name?: string | null;
     reserve_a: number;
     reserve_b: number;
 }
@@ -81,6 +85,7 @@ export async function getTokenMetrics(tokens: string[]): Promise<TokenMetric[]> 
         query: `
       SELECT
         token,
+        argMax(token_name, timestamp) as token_name,
         argMax(price_usd, timestamp) as price_usd,
         argMax(volume_24h, timestamp) as volume_24h,
         argMax(volatility_24h, timestamp) as volatility_24h,
@@ -107,12 +112,14 @@ export async function getPoolData(token: string): Promise<PoolData[]> {
       SELECT
         pool_id,
         token_a,
+        token_a_name,
         token_b,
+        token_b_name,
         argMax(reserve_a, timestamp) as reserve_a,
         argMax(reserve_b, timestamp) as reserve_b
       FROM pools
       WHERE token_a = {token: String} OR token_b = {token: String}
-      GROUP BY pool_id, token_a, token_b
+      GROUP BY pool_id, token_a, token_a_name, token_b, token_b_name
       ORDER BY (reserve_a + reserve_b) DESC
       LIMIT 10
     `,
@@ -147,6 +154,7 @@ export async function getMarketOverview(): Promise<TokenMetric[]> {
         query: `
       SELECT
         token,
+        argMax(token_name, timestamp) as token_name,
         argMax(price_usd, timestamp) as price_usd,
         argMax(volume_24h, timestamp) as volume_24h,
         argMax(volatility_24h, timestamp) as volatility_24h,
@@ -204,6 +212,17 @@ export async function getLinkedWallets(telegramId: string): Promise<string[]> {
     });
     const rows = await result.json<{ wallet_address: string }>();
     return rows.map(r => r.wallet_address);
+}
+
+/**
+ * Get all subscriptions globally (for sync).
+ */
+export async function getAllSubscriptions(): Promise<{ telegram_id: string, wallet_address: string }[]> {
+    const result = await ch.query({
+        query: `SELECT telegram_id, wallet_address FROM user_subscriptions`,
+        format: "JSONEachRow",
+    });
+    return result.json<{ telegram_id: string, wallet_address: string }>();
 }
 
 /**

@@ -17,7 +17,7 @@ export { bot };
 /**
  * Very basic helper to ensure Markdown doesn't break Telegram's strict parser.
  */
-function sanitizeMarkdown(text: string): string {
+export function sanitizeMarkdown(text: string): string {
     return text.replace(/_/g, '\\_');
 }
 
@@ -70,10 +70,11 @@ bot.command("link", async (ctx) => {
         if (summary) {
             if (summary.portfolio_value > 0) {
                 const riskLabel = summary.risk_score >= 70 ? "🔴 HIGH" : summary.risk_score >= 40 ? "🟡 MEDIUM" : "🟢 LOW";
+                const exposureLabel = summary.largest_exposure_token_name || summary.largest_exposure_token.slice(0, 8) + "...";
                 replyText += `\n\n**Initial Risk Analysis:**\n` +
                     `• **Score:** ${summary.risk_score.toFixed(1)}/100 (${riskLabel})\n` +
                     `• **Value:** $${summary.portfolio_value.toFixed(2)}\n` +
-                    `• **Primary Exposure:** \`${summary.largest_exposure_token.slice(0, 8)}...\`\n\n` +
+                    `• **Primary Exposure:** \`${exposureLabel}\`\n\n` +
                     `I will alert you here if any significant shifts occur.`;
             } else {
                 replyText += `\n\n**Preliminary Profile Created:**\n` +
