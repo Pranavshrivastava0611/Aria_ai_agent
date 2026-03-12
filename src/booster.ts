@@ -1,5 +1,5 @@
 import { Connection, PublicKey } from "@solana/web3.js";
-import { getTokenMetrics, getPoolData, saveRiskSummary, RiskSummary, TokenMetric, PoolData } from "./clickhouse";
+import { getTokenMetrics, getPoolData, saveRiskSummary, saveWalletPositions, RiskSummary, TokenMetric, PoolData, WalletPosition } from "./clickhouse";
 import "dotenv/config";
 
 const RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
@@ -17,7 +17,7 @@ function clamp01(v: number): number {
     return Math.max(0, Math.min(1, v));
 }
 
-interface Position {
+export interface Position {
     mint: string;
     amount: number;
     symbol?: string;
@@ -26,7 +26,13 @@ interface Position {
     metrics?: Partial<TokenMetric>;
 }
 
-export async function calculateInstantRisk(walletAddress: string): Promise<RiskSummary | null> {
+export interface EnrichedRiskResult {
+    summary: RiskSummary;
+    positions: Position[];
+    totalValue: number;
+}
+
+export async function calculateInstantRisk(walletAddress: string): Promise<EnrichedRiskResult | null> {
     const cleanWallet = walletAddress.trim();
     console.log(`🚀 Boosting risk analysis (Helius-DAS) for: ${cleanWallet}`);
 
@@ -59,43 +65,49 @@ export async function calculateInstantRisk(walletAddress: string): Promise<RiskS
 
         const dasData = await dasRes.json() as any;
 
-        if (dasData.result && dasData.result.items) {
-            for (const item of dasData.result.items) {
-                // Handle Native SOL
-                if (item.id === "So11111111111111111111111111111111111111112") {
-                    const lamports = item.native_balance || 0;
-                    if (lamports > 0) {
-                        positions.push({
-                            mint: item.id,
-                            amount: lamports / 1e9,
-                            symbol: "SOL",
-                            name: "Solana",
-                            usdValue: 0
-                        });
-                    }
-                    continue;
-                }
+        if (dasData.result) {
+            // Handle Native SOL (Separate field in Helius DAS)
+            if (dasData.result.nativeBalance && dasData.result.nativeBalance.lamports > 0) {
+                const solBalance = dasData.result.nativeBalance.lamports / 1e9;
+                const solPrice = dasData.result.nativeBalance.price_per_sol || 0;
+                console.log(`[Booster] Detected Native SOL: ${solBalance} (Price: $${solPrice})`);
+                positions.push({
+                    mint: "So11111111111111111111111111111111111111112",
+                    amount: solBalance,
+                    symbol: "SOL",
+                    name: "Solana",
+                    usdValue: solBalance * solPrice,
+                    metrics: solPrice > 0 ? {
+                        token: "So11111111111111111111111111111111111111112",
+                        price_usd: solPrice,
+                        volatility_24h: 0.45 // Standard SOL vol
+                    } : undefined
+                });
+            }
 
-                // Handle Tokens
-                if (item.token_info) {
-                    const balance = item.token_info.balance;
-                    const decimals = item.token_info.decimals;
-                    const uiAmount = balance / Math.pow(10, decimals);
+            if (dasData.result.items) {
+                for (const item of dasData.result.items) {
+                    // Handle Tokens
+                    if (item.token_info) {
+                        const balance = item.token_info.balance;
+                        const decimals = item.token_info.decimals;
+                        const uiAmount = balance / Math.pow(10, decimals);
 
-                    if (uiAmount > 0) {
-                        const price = item.token_info.price_info?.price_per_token || 0;
-                        positions.push({
-                            mint: item.id,
-                            amount: uiAmount,
-                            symbol: item.token_info.symbol || item.content?.metadata?.symbol || "Unknown",
-                            name: item.token_info.name || item.content?.metadata?.name || "Unknown",
-                            usdValue: uiAmount * price,
-                            metrics: price > 0 ? {
-                                token: item.id,
-                                price_usd: price,
-                                volatility_24h: 0.6 // Default medium vol if price known but metrics missing
-                            } : undefined
-                        });
+                        if (uiAmount > 0) {
+                            const price = item.token_info.price_info?.price_per_token || 0;
+                            positions.push({
+                                mint: item.id,
+                                amount: uiAmount,
+                                symbol: item.token_info.symbol || item.content?.metadata?.symbol || "Unknown",
+                                name: item.token_info.name || item.content?.metadata?.name || "Unknown",
+                                usdValue: uiAmount * price,
+                                metrics: price > 0 ? {
+                                    token: item.id,
+                                    price_usd: price,
+                                    volatility_24h: 0.6 // Default medium vol if price known but metrics missing
+                                } : undefined
+                            });
+                        }
                     }
                 }
             }
@@ -145,13 +157,14 @@ export async function calculateInstantRisk(walletAddress: string): Promise<RiskS
                 lp_risk: 0,
                 liquidation_risk: 0,
                 correlation_risk: 0,
-                risk_score: 95,
+                risk_score: 0,
                 largest_exposure_token: positions[0]?.mint || "Unknown",
-                ai_summary: `Helius-Cold-Start: Detected ${positions.length} assets, but no trusted pricing data found. Most significant asset: ${positions[0]?.symbol || "Unknown"}`,
+                largest_exposure_token_name: positions[0]?.name || "Unknown",
+                ai_summary: `Cold-Start: Detected ${positions.length} assets, but no trusted pricing data found.`,
                 timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '),
             };
             await saveRiskSummary(preliminary);
-            return preliminary;
+            return { summary: preliminary, positions, totalValue: 0 };
         }
 
         // 4. Score Weighted Risks
@@ -159,6 +172,7 @@ export async function calculateInstantRisk(walletAddress: string): Promise<RiskS
         let weightedSlip = 0;
         let largestVal = 0;
         let largestSymbol = "None";
+        let largestName = "None";
 
         for (const pos of positions) {
             if (pos.usdValue <= 0) continue;
@@ -188,6 +202,7 @@ export async function calculateInstantRisk(walletAddress: string): Promise<RiskS
             if (pos.usdValue > largestVal) {
                 largestVal = pos.usdValue;
                 largestSymbol = pos.symbol || pos.mint.slice(0, 4);
+                largestName = pos.name || largestSymbol;
             }
         }
 
@@ -215,16 +230,74 @@ export async function calculateInstantRisk(walletAddress: string): Promise<RiskS
             correlation_risk: 0,
             risk_score: clamp01(riskScore / 100) * 100,
             largest_exposure_token: largestSymbol,
-            ai_summary: `Helius-Enriched Analysis. Identified ${positions.length} assets. High exposure in $${largestSymbol}.`,
+            largest_exposure_token_name: largestName,
+            ai_summary: `Helius-Enriched Analysis. Identified ${positions.length} assets. High exposure in ${largestName}.`,
             timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '),
         };
 
         console.log(`[Booster] Saving Helius-enriched summary for ${walletAddress}. Score: ${summary.risk_score.toFixed(1)}`);
-        await saveRiskSummary(summary);
 
-        return summary;
+        // 6. Persist raw positions for the Rust engine's continuous tracking
+        const slot = dasData.result?.context?.slot || 0;
+        const ts = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        const dbPositions: WalletPosition[] = positions.map(p => ({
+            wallet: walletAddress,
+            mint: p.mint,
+            balance: p.amount,
+            slot: slot,
+            timestamp: ts
+        }));
+
+        await Promise.all([
+            saveRiskSummary(summary),
+            saveWalletPositions(dbPositions)
+        ]);
+
+        return { summary, positions, totalValue };
     } catch (err) {
         console.error(`Error in Helius Booster:`, err);
+        return null;
+    }
+}
+
+/**
+ * Deep search for a specific token's metadata and price using Helius DAS.
+ * Useful for "unknown" tokens like meme coins that aren't in the risk engine yet.
+ */
+export async function getDeepTokenMetrics(mint: string): Promise<any> {
+    console.log(`[Booster] Deep searching Helius for token: ${mint}`);
+    try {
+        const heliusUrl = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
+        const res = await fetch(heliusUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 'deep-search',
+                method: 'getAsset',
+                params: { id: mint }
+            })
+        });
+
+        const data = await res.json() as any;
+        const asset = data.result;
+
+        if (!asset) return null;
+
+        const info = asset.token_info || {};
+        const metadata = asset.content?.metadata || {};
+
+        return {
+            token: asset.id,
+            name: info.name || metadata.name || "Unknown",
+            symbol: info.symbol || metadata.symbol || "UNK",
+            price_usd: info.price_info?.price_per_token || 0,
+            decimals: info.decimals || 0,
+            supply: info.supply || 0,
+            source: "Helius DAS (Real-time Fallback)"
+        };
+    } catch (err) {
+        console.error("Deep search error:", err);
         return null;
     }
 }

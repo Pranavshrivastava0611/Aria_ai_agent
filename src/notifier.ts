@@ -1,6 +1,6 @@
-import { redis, REVERSE_MAP_PREFIX, WATCHLIST_KEY } from "./redis.js";
-import { bot } from "./telegram.js";
-import { getAllSubscriptions } from "./clickhouse.js";
+import { redis, REVERSE_MAP_PREFIX, WATCHLIST_KEY } from "./redis";
+import { bot } from "./telegram";
+import { getAllSubscriptions } from "./clickhouse";
 import "dotenv/config";
 
 const STREAM_NAME = "risk-alerts";

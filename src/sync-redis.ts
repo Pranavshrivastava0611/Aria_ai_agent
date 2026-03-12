@@ -1,5 +1,5 @@
-import { redis, WATCHLIST_KEY, REVERSE_MAP_PREFIX } from "./redis.js";
-import { getAllSubscriptions } from "./clickhouse.js";
+import { redis, WATCHLIST_KEY, REVERSE_MAP_PREFIX } from "./redis";
+import { getAllSubscriptions } from "./clickhouse";
 
 async function sync() {
     console.log("🔄 Starting manual Redis sync...");

@@ -10,9 +10,9 @@ if (process.env.REJECT_UNAUTHORIZED === "false") {
 }
 import express from "express";
 import cors from "cors";
-import { runAgent, streamAgent } from "./agent.js";
-import { startBot } from "./telegram.js";
-import { startNotifier } from "./notifier.js";
+import { runAgent, streamAgent } from "./agent";
+import { startBot } from "./telegram";
+import { startNotifier } from "./notifier";
 
 const app = express();
 app.use(cors());
@@ -87,8 +87,8 @@ app.get("/health", (_req, res) => {
 });
 
 // ── Start server ──────────────────────────────────────────────
-startNotifier();
 startBot();
+startNotifier();
 
 const PORT = parseInt(process.env.PORT ?? "3001");
 app.listen(PORT, () => {

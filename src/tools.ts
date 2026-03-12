@@ -12,7 +12,9 @@ import {
     getPoolData,
     getTopRiskyWallets,
     getMarketOverview,
-} from "./clickhouse.js";
+} from "./clickhouse";
+import { redis } from "./redis";
+import { getDeepTokenMetrics } from "./booster";
 
 // ── Schema definitions ──
 // Casting to 'any' in schemas to bypass LangChain's deep Zod-to-schema type mapping
@@ -28,6 +30,12 @@ const tokensSchema: any = z.object({
 
 const tokenSchema: any = z.object({
     token: z.string().describe("The token mint address or symbol to analyze pool liquidity for"),
+});
+
+const preferenceSchema: any = z.object({
+    key: z.string().describe("The name of the preference or command to remember (e.g., 'report_frequency', 'risk_tolerance', 'preferred_tokens')"),
+    value: z.string().describe("The value or detailed instruction to store"),
+    user_id: z.optional(z.string()).describe("The user or thread ID to associate this memory with (e.g., 'tg-123456')"),
 });
 
 const emptySchema: any = z.object({});
@@ -57,6 +65,7 @@ export const analyzeWalletTool = langchainTool(
             concentration_risk: (risk.concentration_risk * 100).toFixed(1) + "%",
             lp_impermanent_loss_risk: (risk.lp_risk * 100).toFixed(1) + "%",
             largest_single_asset_exposure: risk.largest_exposure_token,
+            largest_single_asset_name: risk.largest_exposure_token_name || "Unknown",
             risk_engine_summary: risk.ai_summary,
             last_updated: risk.timestamp,
         });
@@ -76,15 +85,22 @@ export const analyzeWalletTool = langchainTool(
 export const tokenRiskTool = langchainTool(
     async (input: any) => {
         const { tokens } = input;
-        const tokenList = tokens.split(",").map((t: string) => t.trim()).filter(Boolean);
+        const tokenList = (tokens as string).split(",").map(t => t.trim()).filter(Boolean);
+
+        // 1. Initially attempt to get metrics from our internal Risk Engine (ClickHouse)
         const metrics = await getTokenMetrics(tokenList);
+        const foundTokens = new Set(metrics.map(m => m.token));
 
-        if (metrics.length === 0) {
-            return JSON.stringify({ error: "No market data found for these tokens. They may not be traded on any indexed DEX pool." });
-        }
+        // 2. Identify missing tokens and trigger Helius Deep Search fallback
+        const missingTokens = tokenList.filter(t => !foundTokens.has(t));
+        const deepSearchResults = await Promise.all(
+            missingTokens.map(t => getDeepTokenMetrics(t))
+        );
 
+        // 3. Construct Unified Results
         const results = metrics.map(m => ({
             token: m.token,
+            name: m.token_name || "Unknown",
             price_usd: m.price_usd,
             volume_24h: "$" + (m.volume_24h / 1000).toFixed(1) + "K",
             annualized_volatility: (m.volatility_24h * 100).toFixed(1) + "%",
@@ -92,14 +108,36 @@ export const tokenRiskTool = langchainTool(
                 m.volatility_24h > 1.5 ? "🔴 Very High" :
                     m.volatility_24h > 0.8 ? "🟡 High" :
                         m.volatility_24h > 0.4 ? "🟠 Medium" : "🟢 Low",
+            source: "Internal Risk Engine"
         }));
+
+        // Add Deep Search fallbacks
+        for (const ds of deepSearchResults) {
+            if (ds) {
+                results.push({
+                    token: ds.token,
+                    name: ds.name,
+                    symbol: ds.symbol,
+                    price_usd: ds.price_usd,
+                    volume_24h: "N/A (Real-time price focus)",
+                    annualized_volatility: "Conservative Estimated: 120%",
+                    risk_level: "🟣 Speculative/New",
+                    source: ds.source
+                } as any);
+            }
+        }
+
+        if (results.length === 0) {
+            return JSON.stringify({ error: "No market data found for these tokens, even via real-time fallbacks." });
+        }
 
         return JSON.stringify(results);
     },
     {
         name: "get_token_market_risk",
-        description: `Fetches real-time market risk metrics for specific tokens: price, 24h volume, and annualized volatility.
-    Use this when a user asks about specific token risks, volatility comparisons, or market conditions.`,
+        description: `Fetches real-time market risk metrics for specific tokens. 
+    If a token is unknown to our risk engine (like a new meme coin), it automatically triggers a deep search via Helius DAS to find price and metadata.
+    Use this when a user asks about specific token prices, risks, or "Buttcoin"-style speculative tokens.`,
         schema: tokensSchema,
     }
 ) as any;
@@ -110,9 +148,25 @@ export const tokenRiskTool = langchainTool(
 export const poolLiquidityTool = langchainTool(
     async (input: any) => {
         const { token } = input;
+
+        // 1. Try ClickHouse first
         const pools = await getPoolData(token);
+
         if (pools.length === 0) {
-            return JSON.stringify({ error: `No pool data found for token: ${token}. It may not be traded on any indexed AMM pool.` });
+            // 2. Fallback to Deep Search for metadata if no pool found
+            const ds = await getDeepTokenMetrics(token);
+            if (ds) {
+                return JSON.stringify({
+                    info: "No liquidity pool found in risk engine, but token identified via Helius.",
+                    token: ds.token,
+                    name: ds.name,
+                    symbol: ds.symbol,
+                    price_usd: ds.price_usd,
+                    liquidity_level: "🔴 Unavailable/Unknown Pools",
+                    source: ds.source
+                });
+            }
+            return JSON.stringify({ error: `No pool or asset data found for token: ${token}.` });
         }
 
         const results = pools.map(p => {
@@ -123,7 +177,7 @@ export const poolLiquidityTool = langchainTool(
 
             return {
                 pool_id: p.pool_id,
-                pair: `${p.token_a} / ${p.token_b}`,
+                pair: `${p.token_a_name || p.token_a} / ${p.token_b_name || p.token_b}`,
                 total_reserve: totalReserve.toFixed(0) + " tokens",
                 estimated_slippage_10k_trade: slippage,
                 liquidity_level:
@@ -154,6 +208,7 @@ export const marketOverviewTool = langchainTool(
 
         const tokenSummary = tokens.slice(0, 10).map(t => ({
             token: t.token.slice(0, 8) + "...",
+            name: t.token_name || "Unknown",
             volatility: (t.volatility_24h * 100).toFixed(1) + "%",
             volume_24h: "$" + (t.volume_24h / 1000).toFixed(1) + "K",
         }));
@@ -180,5 +235,26 @@ export const marketOverviewTool = langchainTool(
         description: `Returns a global DeFi market overview: most volatile tokens tracked, number of wallets analyzed, and overall market risk level.
     Use this when a user asks about general market conditions, whether it's a good time to invest, or what the current market risk is.`,
         schema: emptySchema,
+    }
+) as any;
+
+
+// ── Tool 5: Long-Term Memory (Store Preference) ─────────────
+
+export const storePreferenceTool = langchainTool(
+    async (input: any) => {
+        const { key, value, user_id } = input;
+        const scope = user_id || "global";
+
+        await redis.hset(`aria_long_term_memory:${scope}`, key, value);
+
+        return `✅ I have remembered your preference for '${key}': ${value} (Scope: ${scope})`;
+    },
+    {
+        name: "store_user_preference",
+        description: `Stores a specific user preference, command, or fact into long-term memory. 
+    Use this when a user says "Remember this," "Always do X," or "My preference is Y." 
+    IMPORTANT: If you have context about the user's ID (like 'tg-123'), pass it as 'user_id'.`,
+        schema: preferenceSchema,
     }
 ) as any;

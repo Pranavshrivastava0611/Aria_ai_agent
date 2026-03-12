@@ -51,6 +51,14 @@ export interface PoolData {
     reserve_b: number;
 }
 
+export interface WalletPosition {
+    wallet: string;
+    mint: string;
+    balance: number;
+    slot: number;
+    timestamp: string;
+}
+
 // ─── Query Functions ──────────────────────────────────────────
 
 /**
@@ -239,6 +247,25 @@ export async function saveRiskSummary(row: RiskSummary): Promise<void> {
         console.log(`✅ [ClickHouse] Risk summary inserted successfully for ${row.wallet}.`);
     } catch (err) {
         console.error(`❌ [ClickHouse] Failed to insert risk summary:`, err);
+        throw err;
+    }
+}
+
+/**
+ * Save current wallet positions for downstream risk engine processing.
+ */
+export async function saveWalletPositions(rows: WalletPosition[]): Promise<void> {
+    if (rows.length === 0) return;
+    console.log(`[ClickHouse] Inserting ${rows.length} wallet positions.`);
+    try {
+        await ch.insert({
+            table: "wallet_positions",
+            values: rows,
+            format: "JSONEachRow",
+        });
+        console.log(`✅ [ClickHouse] Wallet positions inserted successfully.`);
+    } catch (err) {
+        console.error(`❌ [ClickHouse] Failed to insert wallet positions:`, err);
         throw err;
     }
 }
